@@ -15,6 +15,8 @@ const { Server } = require("socket.io");
 const authRoutes = require("./routes/auth");
 const meetingRoutes = require("./routes/meetings");
 const Meeting = require("./models/Meeting");
+const transcriptionRoutes = require("./routes/transcription");
+const aiRoutes = require("./routes/ai");
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -23,8 +25,6 @@ const PORT = process.env.PORT || 5000;
 // FRONTEND CORS CONFIGURATION
 // ==========================================
 
-// Supports multiple frontend origins separated by commas.
-// Defaults allow local development and production preview.
 const allowedOrigins = (
   process.env.CLIENT_URLS ||
   "http://localhost:5173,http://localhost:4173"
@@ -35,8 +35,6 @@ const allowedOrigins = (
 
 const corsOptions = {
   origin: (origin, callback) => {
-    // Allow requests without an Origin header
-    // (for example, Postman and server-to-server requests).
     if (!origin || allowedOrigins.includes(origin)) {
       return callback(null, true);
     }
@@ -54,7 +52,6 @@ const corsOptions = {
 
 const httpServer = http.createServer(app);
 
-// Initialize Socket.IO
 const io = new Server(httpServer, {
   cors: corsOptions,
 });
@@ -64,9 +61,7 @@ const io = new Server(httpServer, {
 // ==========================================
 
 app.use(helmet());
-
 app.use(cors(corsOptions));
-
 app.use(express.json({ limit: "10kb" }));
 
 // ==========================================
@@ -102,6 +97,8 @@ app.get("/api/db-health", (req, res) => {
 
 app.use("/api/auth", authRoutes);
 app.use("/api/meetings", meetingRoutes);
+app.use("/api/transcription", transcriptionRoutes);
+app.use("/api/ai", aiRoutes);
 
 // Handle unknown routes
 app.use((req, res) => {
@@ -187,7 +184,6 @@ io.on("connection", (socket) => {
         });
       }
 
-      // Verify that the user belongs to this meeting
       const meeting = await Meeting.findOne({
         meetingCode,
         $or: [
@@ -261,7 +257,6 @@ io.on("connection", (socket) => {
         })
       );
 
-      // Send meeting connection details to the joining participant
       reply({
         success: true,
         message: "Successfully joined the meeting room.",
@@ -280,10 +275,102 @@ io.on("connection", (socket) => {
   });
 
   // ==========================================
+  // REAL-TIME MEETING CHAT
+  // ==========================================
+
+  socket.on("chat:send", async (payload, acknowledge) => {
+    const reply =
+      typeof acknowledge === "function"
+        ? acknowledge
+        : () => {};
+
+    try {
+      const meetingCode = socket.data.meetingCode;
+      const roomName = meetingCode
+        ? `meeting:${meetingCode}`
+        : "";
+
+      const message = String(payload?.message || "").trim();
+
+      if (!meetingCode || !socket.rooms.has(roomName)) {
+        return reply({
+          success: false,
+          message: "Join a meeting before sending messages.",
+        });
+      }
+
+      if (!message) {
+        return reply({
+          success: false,
+          message: "Message cannot be empty.",
+        });
+      }
+
+      if (message.length > 1000) {
+        return reply({
+          success: false,
+          message: "Messages cannot exceed 1000 characters.",
+        });
+      }
+
+      const meeting = await Meeting.findOne({
+        meetingCode,
+        $or: [
+          { host: socket.data.userId },
+          { participants: socket.data.userId },
+        ],
+      }).populate("host participants", "name");
+
+      if (!meeting || meeting.status === "ended") {
+        return reply({
+          success: false,
+          message: "This meeting is no longer available.",
+        });
+      }
+
+      const sender = [meeting.host, ...(meeting.participants || [])]
+        .find(
+          (person) =>
+            person &&
+            String(person._id) === String(socket.data.userId)
+        );
+
+      if (!sender) {
+        return reply({
+          success: false,
+          message: "You are not authorized to send messages here.",
+        });
+      }
+
+      const chatMessage = {
+        id: `${socket.id}-${Date.now()}`,
+        senderId: String(socket.data.userId),
+        senderName: sender.name || "Participant",
+        message,
+        timestamp: new Date().toISOString(),
+      };
+
+      // Broadcast message to everyone in this meeting
+      io.to(roomName).emit("chat:message", chatMessage);
+
+      reply({
+        success: true,
+        message: "Message sent.",
+      });
+    } catch (error) {
+      console.error("Meeting chat error:", error);
+
+      reply({
+        success: false,
+        message: "Unable to send your message.",
+      });
+    }
+  });
+
+  // ==========================================
   // WEBRTC SIGNALING
   // ==========================================
 
-  // Securely forward WebRTC signaling data
   const forwardWebRTCSignal = (
     eventName,
     payload,
@@ -309,12 +396,10 @@ io.on("connection", (socket) => {
 
       const roomName = `meeting:${meetingCode}`;
 
-      // Verify that the sender belongs to the meeting room
       if (!socket.rooms.has(roomName)) {
         return;
       }
 
-      // Verify that the target is in the same meeting
       const targetSocket =
         io.sockets.sockets.get(targetSocketId);
 
@@ -326,7 +411,6 @@ io.on("connection", (socket) => {
         return;
       }
 
-      // Forward signaling data only to the verified target
       io.to(targetSocketId).emit(eventName, {
         fromSocketId: socket.id,
         fromUserId: socket.data.userId,
@@ -385,7 +469,6 @@ io.on("connection", (socket) => {
 
     const roomName = `meeting:${meetingCode}`;
 
-    // Notify other participants that this user left
     socket.to(roomName).emit("participant:left", {
       userId: socket.data.userId,
       socketId: socket.id,
@@ -421,7 +504,7 @@ io.on("connection", (socket) => {
       `Socket disconnected: ${socket.id}. Reason: ${reason}`
     );
   });
-}); // End of io.on("connection")
+});
 
 // ==========================================
 // START SERVER AFTER MONGODB CONNECTS

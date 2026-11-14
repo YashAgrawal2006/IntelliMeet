@@ -3,6 +3,7 @@ import {
   useEffect,
   useRef,
   useState,
+  type FormEvent,
 } from "react";
 import { io, type Socket } from "socket.io-client";
 import "./MeetingRoom.css";
@@ -60,6 +61,15 @@ type ParticipantEvent = {
   socketId: string;
 };
 
+type ChatMessage = {
+  id: string;
+  senderId: string;
+  senderName: string;
+  message: string;
+  timestamp: string;
+};
+
+
 function RemoteVideo({ stream }: { stream: MediaStream }) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
 
@@ -95,12 +105,33 @@ function MeetingRoom({
   const [micEnabled, setMicEnabled] = useState(true);
   const [cameraEnabled, setCameraEnabled] = useState(true);
   const [mediaLoading, setMediaLoading] = useState(false);
+  const [screenStream, setScreenStream] = useState<MediaStream | null>(null);
+  const screenStreamRef = useRef<MediaStream | null>(null);
+  const [screenSharing, setScreenSharing] = useState(false);
 
   const [onlineUserIds, setOnlineUserIds] = useState<string[]>([]);
   const [socketStatus, setSocketStatus] = useState<
     "connecting" | "connected" | "disconnected" | "error"
   >("connecting");
   const [socketError, setSocketError] = useState("");
+
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [chatDraft, setChatDraft] = useState("");
+  const [chatError, setChatError] = useState("");
+  const [chatSending, setChatSending] = useState(false);
+  const chatMessagesEndRef = useRef<HTMLDivElement | null>(null);
+
+  // Meeting audio recording and AI transcription state.
+  const [isRecording, setIsRecording] = useState(false);
+  const [isTranscribing, setIsTranscribing] = useState(false);
+  const [transcript, setTranscript] = useState("");
+  const [transcriptionError, setTranscriptionError] = useState("");
+  const [transcriptionNotice, setTranscriptionNotice] = useState("");
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const recordingChunksRef = useRef<Blob[]>([]);
+  const recordingContextRef = useRef<AudioContext | null>(null);
+  const recordingDestinationRef = useRef<MediaStreamAudioDestinationNode | null>(null);
+  const recordedRemoteStreamIdsRef = useRef<Set<string>>(new Set());
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
@@ -189,8 +220,13 @@ function MeetingRoom({
     const localStream = mediaStreamRef.current;
 
     if (localStream) {
+      const activeScreenTrack = screenStreamRef.current?.getVideoTracks()[0];
       localStream.getTracks().forEach((track) => {
-        peerConnection.addTrack(track, localStream);
+        if (track.kind === "video" && activeScreenTrack) {
+          peerConnection.addTrack(activeScreenTrack, screenStreamRef.current!);
+        } else {
+          peerConnection.addTrack(track, localStream);
+        }
       });
     }
 
@@ -306,6 +342,17 @@ function MeetingRoom({
     });
 
     socketRef.current = socket;
+
+    // Receive messages sent by everyone in this meeting room.
+    const handleIncomingChatMessage = (message: ChatMessage) => {
+      if (!message?.id || !message?.message) return;
+      setChatMessages((previous) => {
+        if (previous.some((item) => item.id === message.id)) return previous;
+        return [...previous, message].slice(-200);
+      });
+    };
+
+    socket.on("chat:message", handleIncomingChatMessage);
 
     socket.on("connect", () => {
       setSocketStatus("connected");
@@ -555,6 +602,7 @@ function MeetingRoom({
 
     // Clean up the socket and peer connections.
     return () => {
+      socket.off("chat:message", handleIncomingChatMessage);
       socket.emit("meeting:leave");
       socket.disconnect();
 
@@ -579,8 +627,8 @@ function MeetingRoom({
   useEffect(() => {
     mediaStreamRef.current = mediaStream;
 
-    if (videoRef.current && mediaStream) {
-      videoRef.current.srcObject = mediaStream;
+    if (videoRef.current) {
+      videoRef.current.srcObject = screenStream || mediaStream;
     }
 
     // When devices are enabled after joining, initiate offers
@@ -591,6 +639,41 @@ function MeetingRoom({
       });
     }
   }, [mediaStream]);
+
+  // Keep the local preview in sync when switching between camera and screen.
+  useEffect(() => {
+    if (videoRef.current) {
+      videoRef.current.srcObject = screenStream || mediaStream;
+    }
+  }, [screenStream, mediaStream]);
+
+  // Add remote participant audio tracks that arrive after recording has started.
+  useEffect(() => {
+    const destination = recordingDestinationRef.current;
+    const context = recordingContextRef.current;
+    if (!destination || !context || context.state === "closed") return;
+
+    remoteStreams.forEach((remoteStream, socketId) => {
+      if (recordedRemoteStreamIdsRef.current.has(socketId)) return;
+      const audioTracks = remoteStream.getAudioTracks().filter((track) => track.readyState === "live");
+      if (!audioTracks.length) return;
+       try {
+        const participantAudio = new MediaStream(audioTracks);
+        context.createMediaStreamSource(participantAudio).connect(destination);
+        recordedRemoteStreamIdsRef.current.add(socketId);
+      } catch (err) {
+        console.warn("Unable to add a participant to the active recording:", err);
+      }
+    });
+  }, [remoteStreams]);
+
+  // Release any active screen capture when the room unmounts.
+  useEffect(() => {
+    return () => {
+      screenStreamRef.current?.getTracks().forEach((track) => track.stop());
+      screenStreamRef.current = null;
+    };
+  }, []);
 
   // Release camera and microphone when the room unmounts.
   useEffect(() => {
@@ -651,6 +734,86 @@ function MeetingRoom({
     }
   };
 
+  // Start screen sharing by replacing the existing WebRTC video sender track.
+  const handleStartScreenShare = async () => {
+    setMediaError("");
+
+    if (!mediaStream) {
+      setMediaError("Enable your camera and microphone before sharing your screen.");
+      return;
+    }
+
+    if (!navigator.mediaDevices?.getDisplayMedia) {
+      setMediaError("Screen sharing is not supported in this browser. Use a supported browser over HTTPS or localhost.");
+      return;
+    }
+
+    try {
+      const capturedStream = await navigator.mediaDevices.getDisplayMedia({
+        video: { frameRate: { ideal: 15, max: 30 } },
+        audio: false,
+      });
+      const screenTrack = capturedStream.getVideoTracks()[0];
+
+      if (!screenTrack) {
+        capturedStream.getTracks().forEach((track) => track.stop());
+        throw new Error("No screen video track was provided by the browser.");
+      }
+
+      const replacements: RTCRtpSender[] = [];
+      for (const connection of peerConnectionsRef.current.values()) {
+        const videoSender = connection.getSenders().find(
+          (sender) => sender.track?.kind === "video"
+        );
+        if (videoSender) {
+          await videoSender.replaceTrack(screenTrack);
+          replacements.push(videoSender);
+        }
+      }
+
+      if (peerConnectionsRef.current.size > 0 && replacements.length === 0) {
+        capturedStream.getTracks().forEach((track) => track.stop());
+        throw new Error("No active video connection is ready for screen sharing. Rejoin the meeting and try again.");
+      }
+
+      screenStreamRef.current = capturedStream;
+      setScreenStream(capturedStream);
+      setScreenSharing(true);
+
+      screenTrack.onended = () => {
+        void handleStopScreenShare();
+      };
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "NotAllowedError") return;
+      setMediaError(err instanceof Error ? err.message : "Unable to start screen sharing.");
+    }
+  };
+
+  // Restore the camera track for every participant when sharing stops.
+  const handleStopScreenShare = async () => {
+    const cameraTrack = mediaStreamRef.current?.getVideoTracks()[0] || null;
+
+    try {
+      for (const connection of peerConnectionsRef.current.values()) {
+        const videoSender = connection.getSenders().find(
+          (sender) => sender.track?.kind === "video" ||
+            sender.track === null
+        );
+        if (videoSender) {
+          await videoSender.replaceTrack(cameraTrack);
+        }
+      }
+    } catch (err) {
+      console.error("Unable to restore camera after screen sharing:", err);
+      setMediaError("Screen sharing stopped, but the camera track could not be restored. Please reconnect your camera.");
+    } finally {
+      screenStreamRef.current?.getTracks().forEach((track) => track.stop());
+      screenStreamRef.current = null;
+      setScreenStream(null);
+      setScreenSharing(false);
+    }
+  };
+
   // Toggle microphone.
   const handleMicToggle = () => {
     if (!mediaStream) return;
@@ -674,6 +837,175 @@ function MeetingRoom({
     videoTrack.enabled = nextState;
     setCameraEnabled(nextState);
   };
+
+  // Start recording a mixed audio track from this device and connected peers.
+  const handleStartRecording = async () => {
+    setTranscriptionError("");
+    setTranscriptionNotice("");
+
+    if (meeting?.status !== "live") {
+      setTranscriptionError("Start the meeting before recording.");
+      return;
+    }
+
+    if (!mediaStream?.getAudioTracks().length) {
+      setTranscriptionError("Enable your microphone and devices before recording.");
+      return;
+    }
+
+    const consent = window.confirm(
+      "Start recording this meeting's audio for AI transcription? Make sure every participant has been informed and has agreed before you continue."
+    );
+    if (!consent) return;
+
+    try {
+      if (!window.AudioContext) {
+        throw new Error("Audio recording is not supported by this browser.");
+      }
+
+      const audioContext = new AudioContext();
+      await audioContext.resume();
+      const destination = audioContext.createMediaStreamDestination();
+      let connectedSources = 0;
+
+      const localAudio = mediaStream.getAudioTracks().filter((track) => track.readyState === "live");
+      if (localAudio.length) {
+        const localAudioStream = new MediaStream(localAudio);
+        audioContext.createMediaStreamSource(localAudioStream).connect(destination);
+        connectedSources += 1;
+      }
+
+      // Include audio received from every remote WebRTC stream currently connected.
+      const recordedRemoteIds = new Set<string>();
+      remoteStreams.forEach((remoteStream, socketId) => {
+        const audioTracks = remoteStream.getAudioTracks().filter((track) => track.readyState === "live");
+        if (audioTracks.length) {
+          const remoteAudioStream = new MediaStream(audioTracks);
+          audioContext.createMediaStreamSource(remoteAudioStream).connect(destination);
+          recordedRemoteIds.add(socketId);
+          connectedSources += 1;
+        }
+      });
+
+      if (!connectedSources || !destination.stream.getAudioTracks().length) {
+        await audioContext.close();
+        throw new Error("No active meeting audio was found. Check your microphone and participant connections.");
+      }
+
+      const preferredMimeType = "audio/webm;codecs=opus";
+      const options = MediaRecorder.isTypeSupported(preferredMimeType)
+        ? { mimeType: preferredMimeType }
+        : undefined;
+      const recorder = new MediaRecorder(destination.stream, options);
+      recordingChunksRef.current = [];
+      recordingContextRef.current = audioContext;
+      recordingDestinationRef.current = destination;
+      recordedRemoteStreamIdsRef.current = recordedRemoteIds;
+      recorderRef.current = recorder;
+
+      recorder.ondataavailable = (event: BlobEvent) => {
+        if (event.data.size > 0) recordingChunksRef.current.push(event.data);
+        const currentSize = recordingChunksRef.current.reduce((total, chunk) => total + chunk.size, 0);
+        // Leave headroom below the server's 25 MB upload limit.
+        if (currentSize >= 22 * 1024 * 1024 && recorder.state === "recording") {
+          setTranscriptionNotice("Recording reached the safe upload limit and has been stopped.");
+          recorder.stop();
+        }
+      };
+
+      recorder.onerror = () => {
+        setTranscriptionError("The browser encountered an error while recording audio.");
+        setIsRecording(false);
+      };
+
+      recorder.onstop = async () => {
+        setIsRecording(false);
+        setIsTranscribing(true);
+        setTranscriptionNotice("Uploading meeting audio and generating the transcript...");
+
+        try {
+          const audioBlob = new Blob(recordingChunksRef.current, {
+            type: recorder.mimeType || "audio/webm",
+          });
+          recordingChunksRef.current = [];
+
+          if (!audioBlob.size) {
+            throw new Error("The recording is empty. Please record again.");
+          }
+          if (audioBlob.size > 25 * 1024 * 1024) {
+            throw new Error("The audio file exceeds the server's 25 MB upload limit. Record a shorter segment.");
+          }
+
+          const token = sessionStorage.getItem("intellimeet_token");
+          if (!token) throw new Error("Your session has expired. Please log in again.");
+
+          const formData = new FormData();
+          formData.append("audio", audioBlob, `intellimeet-${meetingCode.toLowerCase()}-${Date.now()}.webm`);
+
+          const response = await fetch(`${API_BASE_URL}/transcription`, {
+            method: "POST",
+            headers: { Authorization: `Bearer ${token}` },
+            body: formData,
+          });
+          const data = await response.json();
+          if (!response.ok || !data.success) {
+            throw new Error(data.message || "Unable to transcribe this recording.");
+          }
+
+          setTranscript(typeof data.transcript === "string" ? data.transcript : "");
+          setTranscriptionNotice("Transcription completed successfully.");
+        } catch (err) {
+          setTranscriptionError(err instanceof Error ? err.message : "Unable to transcribe the recording.");
+          setTranscriptionNotice("");
+        } finally {
+          setIsTranscribing(false);
+          const context = recordingContextRef.current;
+          recordingContextRef.current = null;
+          recordingDestinationRef.current = null;
+          recordedRemoteStreamIdsRef.current.clear();
+          if (context && context.state !== "closed") {
+            await context.close().catch(() => undefined);
+          }
+          recorderRef.current = null;
+        }
+      };
+
+      recorder.start(1000);
+      setIsRecording(true);
+      setTranscriptionNotice("Recording is active. Participants should be informed that meeting audio is being recorded.");
+    } catch (err) {
+      setTranscriptionError(err instanceof Error ? err.message : "Unable to start meeting recording.");
+      const context = recordingContextRef.current;
+      recordingContextRef.current = null;
+      recordingDestinationRef.current = null;
+      recordedRemoteStreamIdsRef.current.clear();
+      if (context && context.state !== "closed") await context.close().catch(() => undefined);
+    }
+  };
+
+  const handleStopRecording = () => {
+    const recorder = recorderRef.current;
+    if (recorder && recorder.state !== "inactive") recorder.stop();
+  };
+
+  const handleCopyTranscript = async () => {
+    try {
+      await navigator.clipboard.writeText(transcript);
+      setTranscriptionNotice("Transcript copied to clipboard.");
+    } catch {
+      setTranscriptionError("Unable to copy the transcript. You can select and copy the text manually.");
+    }
+  };
+
+  // Stop an active recording if the user leaves or the room unmounts.
+  useEffect(() => {
+    return () => {
+      const recorder = recorderRef.current;
+      if (recorder && recorder.state !== "inactive") recorder.stop();
+      const context = recordingContextRef.current;
+      if (context && context.state !== "closed") void context.close();
+    };
+  }, []);
 
   // Start or end the meeting.
   const handleMeetingAction = async (
@@ -742,6 +1074,38 @@ function MeetingRoom({
       );
     }
   };
+
+  // Send a message to all participants in the current meeting.
+  const handleSendChatMessage = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const message = chatDraft.trim();
+    const socket = socketRef.current;
+
+    if (!message || chatSending) return;
+    if (!socket?.connected) {
+      setChatError("Chat is unavailable because the real-time connection is offline.");
+      return;
+    }
+
+    setChatError("");
+    setChatSending(true);
+    socket.emit(
+      "chat:send",
+      { message },
+      (response: { success: boolean; message?: string }) => {
+        setChatSending(false);
+        if (!response?.success) {
+          setChatError(response?.message || "Unable to send your message.");
+          return;
+        }
+        setChatDraft("");
+      }
+    );
+  };
+
+  useEffect(() => {
+    chatMessagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [chatMessages]);
 
   // Loading screen.
   if (loading) {
@@ -824,7 +1188,6 @@ function MeetingRoom({
           </button>
         </div>
       </header>
-
       {/* Main meeting workspace */}
       <section className="meeting-workspace">
         <div className="meeting-stage-area">
@@ -842,6 +1205,12 @@ function MeetingRoom({
               {participants.length !== 1 ? "s" : ""}
             </span>
           </div>
+
+          {isRecording && (
+            <div className="recording-live-banner" role="status">
+              <span className="recording-pulse" /> Recording is active — meeting audio is being captured for transcription.
+            </div>
+          )}
 
           {error && (
             <p className="room-alert" role="alert">
@@ -865,7 +1234,7 @@ function MeetingRoom({
           <div className="participant-grid">
             {/* Local participant */}
             <article className="participant-tile local-participant">
-              {mediaStream && cameraEnabled ? (
+              {(screenSharing || (mediaStream && cameraEnabled)) ? (
                 <video
                   ref={videoRef}
                   className="participant-video"
@@ -894,9 +1263,11 @@ function MeetingRoom({
 
                 <span className="participant-device-status">
                   {micEnabled && mediaStream ? "🎙️" : "🔇"}
-                  {!cameraEnabled || !mediaStream
-                    ? " · 📷 Off"
-                    : " · 📷"}
+                  {screenSharing
+                    ? " · 🖥️ Sharing"
+                    : !cameraEnabled || !mediaStream
+                      ? " · 📷 Off"
+                      : " · 📷"}
                 </span>
               </div>
 
@@ -1065,6 +1436,93 @@ function MeetingRoom({
               </strong>
             </div>
           </div>
+
+          <section className="sidebar-card transcription-card" aria-label="Meeting transcription">
+            <div className="sidebar-card-heading">
+              <h3>AI transcription</h3>
+              <span>{isRecording ? "REC" : "AI"}</span>
+            </div>
+            <p className="transcription-description">
+              Record the meeting audio and convert the conversation into text with AI.
+            </p>
+            <div className="transcription-actions">
+              {!isRecording ? (
+                <button
+                  type="button"
+                  className="transcription-button record-button"
+                  onClick={handleStartRecording}
+                  disabled={meeting.status !== "live" || isTranscribing || !mediaStream}
+                >
+                  {isTranscribing ? "Transcribing..." : "● Start recording"}
+                </button>
+              ) : (
+                <button type="button" className="transcription-button stop-recording-button" onClick={handleStopRecording}>
+                  ■ Stop & transcribe
+                </button>
+              )}
+            </div>
+            {!mediaStream && <p className="transcription-hint">Enable your microphone and devices first.</p>}
+            {meeting.status !== "live" && <p className="transcription-hint">Recording is available while the meeting is live.</p>}
+            {transcriptionNotice && <p className="transcription-notice" role="status">{transcriptionNotice}</p>}
+            {transcriptionError && <p className="transcription-error" role="alert">{transcriptionError}</p>}
+            {transcript && (
+              <div className="transcript-result">
+                <div className="transcript-result-heading">
+                  <strong>Meeting transcript</strong>
+                  <button type="button" onClick={handleCopyTranscript}>Copy</button>
+                </div>
+                <textarea aria-label="Generated meeting transcript" value={transcript} readOnly rows={7} />
+                <p>Copy this transcript into the AI Assistant on your dashboard to generate a summary and action items.</p>
+              </div>
+            )}
+          </section>
+
+          <section className="sidebar-card meeting-chat-card" aria-label="Meeting chat">
+            <div className="sidebar-card-heading meeting-chat-heading">
+              <h3>Meeting chat</h3>
+              <span>{chatMessages.length}</span>
+            </div>
+
+            <div className="meeting-chat-messages" aria-live="polite" aria-relevant="additions">
+              {chatMessages.length === 0 ? (
+                <p className="meeting-chat-empty">No messages yet. Say hello to your team!</p>
+              ) : (
+                chatMessages.map((chatMessage) => {
+                  const ownMessage = String(chatMessage.senderId) === String(currentUserId);
+                  return (
+                    <article className={`meeting-chat-message ${ownMessage ? "own-message" : ""}`} key={chatMessage.id}>
+                      <div className="meeting-chat-message-meta">
+                        <strong>{ownMessage ? "You" : chatMessage.senderName}</strong>
+                        <time dateTime={chatMessage.timestamp}>
+                          {new Date(chatMessage.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                        </time>
+                      </div>
+                      <p>{chatMessage.message}</p>
+                    </article>
+                  );
+                })
+              )}
+              <div ref={chatMessagesEndRef} />
+            </div>
+
+            {chatError && <p className="meeting-chat-error" role="alert">{chatError}</p>}
+
+            <form className="meeting-chat-form" onSubmit={handleSendChatMessage}>
+              <input
+                type="text"
+                value={chatDraft}
+                onChange={(event) => setChatDraft(event.target.value)}
+                placeholder="Type a message..."
+                maxLength={1000}
+                aria-label="Type a meeting message"
+                disabled={socketStatus !== "connected" || meeting.status === "ended" || chatSending}
+              />
+              <button type="submit" disabled={!chatDraft.trim() || socketStatus !== "connected" || meeting.status === "ended" || chatSending}>
+                {chatSending ? "Sending..." : "Send"}
+              </button>
+            </form>
+            <p className="meeting-chat-footnote">Messages are shared live with everyone in this meeting.</p>
+          </section>
         </aside>
       </section>
 
@@ -1096,6 +1554,17 @@ function MeetingRoom({
               </span>
             </button>
           )}
+
+          <button
+            type="button"
+            className={`meeting-control-button ${screenSharing ? "primary-control" : ""}`}
+            onClick={screenSharing ? handleStopScreenShare : handleStartScreenShare}
+            disabled={!mediaStream || meeting.status !== "live"}
+            title={screenSharing ? "Stop sharing your screen" : "Share your screen"}
+          >
+            <span>🖥️</span>
+            <span>{screenSharing ? "Stop sharing" : "Share screen"}</span>
+          </button>
 
           <button
             type="button"
